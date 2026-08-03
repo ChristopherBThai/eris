@@ -565,6 +565,11 @@ declare namespace Eris {
     ratelimiterOffset?: number;
     requestTimeout?: number;
   }
+  interface RequestOptions {
+    rejectOn429?: boolean;
+    route?: string;
+    short?: boolean;
+  }
 
   // Command
   interface CommandCooldownExclusions {
@@ -1836,6 +1841,9 @@ declare namespace Eris {
     rateLimitPerUser?: number;
     reason?: string;
   }
+  interface CreateThreadWithMessageOptions extends CreateThreadOptions {
+    rejectOn429?: boolean;
+  }
   interface CreateForumThreadOptions extends CreateThreadOptions {
     appliedTags?: string[];
     message: Omit<AdvancedMessageContent, "messageReference" | "messageReferenceID" | "tts"> & FileContent[];
@@ -2211,7 +2219,7 @@ declare namespace Eris {
     createStageInstance(channelID: string, options: StageInstanceOptions): Promise<StageInstance>;
     createThread(channelID: string, options: CreateForumThreadOptions, file?: FileContent | FileContent[]): Promise<PublicThreadChannel<true>>;
     createThread(channelID: string, options: CreateThreadWithoutMessageOptions, file?: FileContent | FileContent[]): Promise<NewsThreadChannel | PrivateThreadChannel | PublicThreadChannel>;
-    createThreadWithMessage(channelID: string, messageID: string, options: CreateThreadOptions): Promise<NewsThreadChannel | PublicThreadChannel>;
+    createThreadWithMessage(channelID: string, messageID: string, options: CreateThreadWithMessageOptions): Promise<NewsThreadChannel | PublicThreadChannel>;
     /** @deprecated */
     createThreadWithoutMessage(channelID: string, options: CreateThreadWithoutMessageOptions): Promise<NewsThreadChannel | PrivateThreadChannel | PublicThreadChannel>;
     crosspostMessage(channelID: string, messageID: string): Promise<Message>;
@@ -2525,6 +2533,8 @@ declare namespace Eris {
     req: ClientRequest;
     res: IncomingMessage;
     response: HTTPResponse;
+    /** The retry delay in milliseconds when a 429 response is rejected. */
+    retryAfter?: number;
     constructor(req: ClientRequest, res: IncomingMessage, response: HTTPResponse, stack: string);
     flattenErrors(errors: HTTPResponse, keyPrefix?: string): string[];
   }
@@ -2536,6 +2546,8 @@ declare namespace Eris {
     req: ClientRequest;
     res: IncomingMessage;
     response: HTTPResponse;
+    /** The retry delay in milliseconds when a 429 response is rejected. */
+    retryAfter?: number;
     constructor(req: ClientRequest, res: IncomingMessage, response: HTTPResponse, stack: string);
     flattenErrors(errors: HTTPResponse, keyPrefix?: string): string[];
   }
@@ -3159,7 +3171,7 @@ declare namespace Eris {
     webhookID: T extends GuildTextableWithThreads ? string | undefined : undefined;
     constructor(data: BaseData, client: Client);
     addReaction(reaction: string): Promise<void>;
-    createThreadWithMessage(options: CreateThreadOptions): Promise<NewsThreadChannel | PublicThreadChannel>;
+    createThreadWithMessage(options: CreateThreadWithMessageOptions): Promise<NewsThreadChannel | PublicThreadChannel>;
     crosspost(): Promise<T extends NewsChannel ? Message<NewsChannel> : never>;
     delete(reason?: string): Promise<void>;
     deleteWebhook(token: string): Promise<void>;
@@ -3262,6 +3274,8 @@ declare namespace Eris {
     /** @deprecated */
     constructor(client: Client, forceQueueing?: boolean);
     globalUnblock(): void;
+    request(method: RequestMethod, url: string, auth?: boolean, body?: Record<string, unknown>, file?: FileContent, options?: RequestOptions): Promise<unknown>;
+    /** @deprecated Use the RequestOptions overload instead. */
     request(method: RequestMethod, url: string, auth?: boolean, body?: Record<string, unknown>, file?: FileContent, _route?: string, short?: boolean): Promise<unknown>;
     routefy(url: string, method: RequestMethod): string;
     toString(): string;
@@ -3452,7 +3466,7 @@ declare namespace Eris {
     type: GuildTextChannelTypes;
     createInvite(options?: CreateChannelInviteOptions, reason?: string): Promise<Invite<"withMetadata", this>>;
     createThread(options: CreateThreadWithoutMessageOptions): Promise<AnyThreadChannel>;
-    createThreadWithMessage(messageID: string, options: CreateThreadOptions): Promise<NewsThreadChannel | PublicThreadChannel>;
+    createThreadWithMessage(messageID: string, options: CreateThreadWithMessageOptions): Promise<NewsThreadChannel | PublicThreadChannel>;
     /** @deprecated */
     createThreadWithoutMessage(options: CreateThreadWithoutMessageOptions): Promise<AnyThreadChannel>;
     createWebhook(options: WebhookCreateOptions, reason?: string | undefined): Promise<Webhook>;
