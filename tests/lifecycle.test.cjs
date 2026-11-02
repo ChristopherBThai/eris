@@ -169,3 +169,242 @@ test('callback global429 reject retains application-global bookkeeping',async()=
  assert.equal(h.handler.globalBlock,true);assert.equal(Object.keys(h.handler.ratelimits).length,0);
  await h.advance(50);assert.equal(h.handler.globalBlock,false);
 });
+
+
+// S02-r4: terminal cooldown and unusable body conversion regressions.
+for(const scope of ['user','shared','global'])for(const offset of [0,25])for(const [label,extra,delay] of [
+  ['header',{'retry-after':'0.05'},50],
+  ['reset precedence',{'retry-after':'0.05','x-ratelimit-reset-after':'0.08'},80],
+  ['absent',{},0], ['invalid',{'retry-after':'invalid'},0],
+])test(`terminal 429 cooldown ${scope} ${offset} ${label}`,async()=>{
+  const h=harness({ratelimiterOffset:offset});let settlements=0;
+  const a=h.handler.request('POST','/normal',true,{rejectOn429:true}).catch(e=>{settlements++;return e;});
+  const b=h.handler.request('POST','/normal',true);await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0];assert.equal(bucket.owners,2);
+  const resp=h.respond(0,429,{'content-type':'application/json','x-ratelimit-remaining':'0','x-ratelimit-scope':scope,...(scope==='global'?{'x-ratelimit-global':'true'}:{}),...extra},'{}');
+  assert.equal((await a).name,'DiscordHTTPError');assert.equal(bucket.owners,1);
+  const c=h.handler.request('POST','/independent',true);await h.flush();
+  const globalDelay=scope==='global'&&extra['retry-after']==='0.05'?50:0;
+  assert.equal(h.sent.length,globalDelay?1:2);
+  if(globalDelay){await h.advance(globalDelay);assert.equal(h.sent[1].options.path,'/api/v10/independent');}
+  h.respond(1,204);await c;
+  const wait=delay+offset+1;
+  await h.advance(wait-globalDelay-1);assert.equal(h.sent.length,2);
+  await h.advance(1);assert.equal(h.sent.length,3);assert.equal(h.sent[2].at,100000+wait);
+  resp.emit('end');resp.emit('aborted');await h.flush();assert.equal(settlements,1);assert.equal(bucket.owners,1);
+  h.respond(2,204);await b;assert.equal(bucket.owners,0);assert.equal(bucket.processing,false);
+});
+for(const scope of ['user','shared','global'])for(const isCallback of [false,true])for(const terminal of [false,true])test(`overflow fallback ${scope} callback=${isCallback} terminal=${terminal}`,async()=>{
+  const h=harness(),endpoint=isCallback?callback:'/normal';let settlements=0;
+  const a=h.handler.request('POST',endpoint,true,{rejectOn429:terminal}).then(()=>{settlements++;},e=>{settlements++;return e;});
+  const b=isCallback?null:h.handler.request('POST',endpoint,true);await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0];
+  h.respond(0,429,{'content-type':'application/json','retry-after':'0.03','x-ratelimit-remaining':'9','x-ratelimit-scope':scope,...(scope==='global'?{'x-ratelimit-global':'true'}:{})},'{"retry_after":1e308}');
+  await h.flush();if(terminal)assert.equal((await a).name,'DiscordHTTPError');else assert.equal(settlements,0);
+  const c=h.handler.request('POST','/independent',true);await h.flush();
+  assert.equal(h.handler.globalBlock,scope==='global');
+  const initial=h.sent.length;await h.advance(29);assert.equal(h.sent.length,initial);
+  await h.advance(1);
+  const independent=h.sent.find(r=>r.options.path.endsWith('/independent'));assert(independent);assert.equal(independent.at,scope==='global'?100030:100000);
+  if(bucket)assert.equal(bucket.owners,terminal?1:2);
+  if(!terminal&&!isCallback)assert.equal(h.sent.filter(r=>r.options.path===h.sent[0].options.path).length,2);
+  if(!terminal){const retry=h.sent.find((r,i)=>i>0&&r.options.path===h.sent[0].options.path);assert(retry);assert.equal(retry.at,100030);}
+  // Finish all sends, including B admitted only after A succeeds.
+  for(let i=1;i<h.sent.length;i++){h.respond(i,204);await h.flush();}
+  await Promise.all([a,b,c]);assert.equal(settlements,1);if(bucket)assert.equal(bucket.owners,0);
+});
+for(const scope of ['user','shared','global'])for(const header of [undefined,'invalid','9'.repeat(309)])test(`overflow without usable fallback ${scope} ${header}`,async()=>{
+  const h=harness();let settlements=0;
+  const a=h.handler.request('POST','/normal',true).catch(e=>{settlements++;return e;}),b=h.handler.request('POST','/normal',true);await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0];
+  const resp=h.respond(0,429,{'retry-after':header,'x-ratelimit-scope':scope,...(scope==='global'?{'x-ratelimit-global':'true'}:{})},'{"retry_after":1e308}');
+  assert.match((await a).message,/Invalid 429 retry delay/);assert.equal(h.handler.globalBlock,false);assert.equal(bucket.owners,1);
+  resp.emit('end');resp.emit('aborted');await h.flush();assert.equal(settlements,1);assert.equal(h.sent.length,2);
+  h.respond(1,204);await b;assert.equal(bucket.owners,0);
+});
+
+test('finite converted delay above timer range remains authoritative',async()=>{
+  const h=harness(),a=h.handler.request('POST',callback,false);await h.flush();
+  h.respond(0,429,{'retry-after':'0.03'},'{"retry_after":3000000}');
+  assert(h.timers.some(t=>t.at===100000+3000000000));
+  await h.advance(30);assert.equal(h.sent.length,1);
+  await h.advance(3000000000-30);assert.equal(h.sent[1].at,100000+3000000000);h.respond(1,204);await a;
+});
+
+// S02_ONLY
+for (const [body,header,delay] of [
+  ['{"retry_after":0.08}','0.02',80], ['{"retry_after":0}','1',0],
+  ['{"retry_after":0.0015}',undefined,1.5], ['invalid','0.03',30],
+  ['0','0.03',30], ['-0','0.03',30],
+  ['{"retry_after":null}','0.03',30], ['{"retry_after":-1}','0.03',30],
+  ['{"retry_after":"0.01"}','0.03',30], ['{"retry_after":1e999}','0.03',30],
+]) test(`429 timing ${body} ${header}`, async () => {
+  const h=harness(); const a=h.handler.request('PATCH',url,false,{content:'A'}), b=h.handler.request('PATCH',url,false,{content:'B'});
+  await h.flush(); h.respond(0,429,{'content-type':'application/json','retry-after':header,'x-ratelimit-remaining':'9','x-ratelimit-reset-after':'0'},body);
+  if(delay) { await h.advance(delay-0.1); assert.equal(h.sent.length,1); await h.advance(0.1); } else await h.advance(0);
+  assert.equal(h.sent.length,2); assert.equal(h.sent[1].at,100000+delay); assert.equal(JSON.parse(h.sent[1].data).content,'A');
+  h.respond(1,204); await h.flush(); assert.equal(JSON.parse(h.sent[2].data).content,'B'); h.respond(2,204); await Promise.all([a,b]);
+  assert.equal(Object.values(h.handler.ratelimits)[0].owners,0);
+});
+for(const body of ['invalid','{}','{"retry_after":null}','{"retry_after":-1}','{"retry_after":1e999}']) test(`invalid retry releases ${body}`,async()=>{
+  const h=harness(); const a=h.handler.request('PATCH',url,false).catch(e=>e), b=h.handler.request('PATCH',url,false);
+  await h.flush(); h.respond(0,429,{'x-ratelimit-scope':'shared','retry-after':''},body); assert.match((await a).message,/Invalid 429/);
+  await h.flush(); assert.equal(h.sent.length,2); h.respond(1,204); await b;
+});
+for(const body of ['0','-0'])for(const header of [undefined,'invalid'])test(`zero-root invalid retry releases ${body} ${header}`,async()=>{
+  const h=harness(); let settled=0;
+  const a=h.handler.request('PATCH',url,false,{content:'A'}).catch(e=>{settled++;return e;}), b=h.handler.request('PATCH',url,false,{content:'B'});
+  await h.flush(); const bucket=Object.values(h.handler.ratelimits)[0]; assert.equal(bucket.owners,2);
+  const resp=h.respond(0,429,{'content-type':'application/json','x-ratelimit-scope':'shared','retry-after':header},body);
+  await h.flush(); assert.equal(settled,1); assert.match((await a).message,/Invalid 429 retry delay/);
+  assert.equal(bucket.owners,1); assert.equal(h.sent.length,2); assert.equal(JSON.parse(h.sent[1].data).content,'B');
+  resp.emit('end'); resp.emit('aborted'); await h.advance(0); assert.equal(settled,1); assert.equal(bucket.owners,1); assert.equal(h.sent.length,2);
+  h.respond(1,204); await b; assert.equal(bucket.owners,0); assert.equal(bucket.processing,false);
+});
+test('502 releases slot, retains owner, and preserves more than four retries',async()=>{
+  const h=harness(); const a=h.handler.request('PATCH',url,false,{content:'A'}), b=h.handler.request('PATCH',url,false,{content:'B'});
+  await h.flush(); const bucket=Object.values(h.handler.ratelimits)[0]; h.respond(0,502); await h.flush();
+  assert.equal(JSON.parse(h.sent[1].data).content,'B'); assert.equal(bucket.owners,2); h.respond(1,204); await b;
+  assert.equal(bucket.owners,1); await h.advance(2000);
+  for(let i=0;i<5;i++){ h.respond(h.sent.length-1,502); await h.advance(2000); }
+  h.respond(h.sent.length-1,204); await a; assert.equal(bucket.owners,0);
+});
+test('late events do not retry or release twice; sweep retains active and expires idle',async()=>{
+  const h=harness(); const p=h.handler.request('PATCH',url,false).catch(e=>e); await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0]; assert(h.timers.find(t=>t.unreffed));
+  await h.advance(30000); assert.equal(Object.values(h.handler.ratelimits)[0],bucket);
+  h.sent[0].timeout(); await p; const resp=h.respond(0,429,{'retry-after':'0'},'{}'); resp.emit('aborted');
+  await h.advance(0); assert.equal(h.sent.length,1); assert.equal(bucket.owners,0);
+  await h.advance(30000); assert.equal(Object.keys(h.handler.ratelimits).length,0);
+});
+test('retry context and one completion',async()=>{
+  const h=harness(), als=new AsyncLocalStorage(), events=[];
+  const channel=require('diagnostics_channel').channel('eris.request.phase');
+  const listener=e=>events.push([e,als.getStore()]); channel.subscribe(listener);
+  try {
+    const p=als.run('A',()=>h.handler.request('PATCH',url,false)); await h.flush();
+    h.respond(0,429,{'retry-after':'0'},'{}'); await h.advance(0); h.respond(1,204); await p;
+    const complete=events.filter(([e])=>e.event==='complete'); assert.equal(complete.length,1); assert.equal(complete[0][0].attempts,2);
+    assert.equal(complete[0][1],'A'); assert(events.filter(([e])=>e.event==='start' && e.phase.labels.attempt===2).every(([,ctx])=>ctx==='A'));
+  } finally { channel.unsubscribe(listener); }
+});
+
+test('route cooldown longer than authoritative delay consumes retry token',async()=>{
+  const h=harness(); const a=h.handler.request('PATCH',url,false), b=h.handler.request('PATCH',url,false);
+  await h.flush(); h.respond(0,429,{'retry-after':'0.01','x-ratelimit-reset-after':'0.1','x-ratelimit-remaining':'0'},'{}');
+  await h.advance(100); assert.equal(h.sent.length,1); await h.advance(1); assert.equal(h.sent.length,2);
+  assert.equal(Object.values(h.handler.ratelimits)[0].remaining,0); h.respond(1,204); await h.flush(); h.respond(2,204); await Promise.all([a,b]);
+});
+test('callback global 429 uses body delay with no bucket',async()=>{
+  const h=harness(); const a=h.handler.request('POST',callback,true);
+  await h.flush(); h.respond(0,429,{'x-ratelimit-global':'true','x-ratelimit-reset-after':'0.001','retry-after':'0.002'},'{"retry_after":0.05}');
+  const b=h.handler.request('GET','/normal',true); await h.flush(); assert.equal(h.sent.length,1);
+  await h.advance(49); assert.equal(h.sent.length,1); await h.advance(1); assert.equal(h.sent.length,3);
+  h.respond(1,204); h.respond(2,204); await Promise.all([a,b]); assert.equal(Object.keys(h.handler.ratelimits).length,1);
+});
+for (const kind of ['serialization','multipart','abort','error','response-abort','json','http','reject429']) test(`terminal ${kind} releases owner`,async()=>{
+  const h=harness(); let body, file;
+  if(kind==='serialization'){body={};body.self=body;}
+  if(kind==='multipart')file={};
+  if(kind==='reject429')body={rejectOn429:true};
+  const a=h.handler.request('PATCH',url,false,body,file).catch(e=>e); await h.flush();
+  if(h.sent.length){
+    if(kind==='abort') h.sent[0].abort();
+    else if(kind==='error') h.sent[0].emit('error',new Error('synthetic'));
+    else if(kind==='response-abort') {const resp=new EventEmitter(); resp.headers={}; h.sent[0].emit('response',resp);resp.emit('aborted');}
+    else h.respond(0,kind==='json'?200:kind==='reject429'?429:400,{'content-type':'application/json'},kind==='json'?'bad':'{}');
+  }
+  assert((await a).message); const bucket=Object.values(h.handler.ratelimits)[0];assert.equal(bucket.owners,0);assert.equal(bucket.processing,false);
+  const b=h.handler.request('PATCH',url,false);await h.flush();await h.advance(2);h.respond(h.sent.length-1,204);await b;
+});
+
+for(const endpoint of [callback,url])for(const valid of [true,false])test(`reject429 global bookkeeping ${endpoint} valid=${valid}`,async()=>{
+  const h=harness(), p=h.handler.request('POST',endpoint,true,{rejectOn429:true}).catch(e=>e);await h.flush();
+  h.respond(0,429,{'content-type':'application/json','x-ratelimit-global':'true','retry-after':valid?'0.001':''},valid?'{"retry_after":0.05}':'{}');
+  assert.equal((await p).name,'DiscordHTTPError');assert.equal(h.handler.globalBlock,valid);
+  const q=h.handler.request('GET','/normal',true);await h.flush();assert.equal(h.sent.length,valid?1:2);
+  if(valid){await h.advance(49);assert.equal(h.sent.length,1);await h.advance(1);assert.equal(h.sent.length,2);}
+  h.respond(1,204);await q;await h.advance(100);assert.equal(h.sent.length,2);
+});
+test('independent webhook proceeds and B arriving during sleep stays after A',async()=>{
+  const h=harness(), a=h.handler.request('PATCH',url,false,{content:'A'});await h.flush();h.respond(0,429,{'retry-after':'0.1'},'{}');await h.advance(20);
+  const b=h.handler.request('PATCH',url,false,{content:'B'}), c=h.handler.request('PATCH',url.replace('x'.repeat(64),'y'.repeat(64)),false,{content:'C'});await h.flush();
+  assert.equal(h.sent.length,2);assert.equal(JSON.parse(h.sent[1].data).content,'C');h.respond(1,204);await c;
+  await h.advance(80);assert.equal(JSON.parse(h.sent[2].data).content,'A');h.respond(2,204);await a;await h.flush();assert.equal(JSON.parse(h.sent[3].data).content,'B');h.respond(3,204);await b;
+});
+for(const retained of [false,true])test(`global block appearing during bucket wakeup retained=${retained}`,async()=>{
+  const h=harness(), a=h.handler.request('PATCH',url,true);await h.flush();
+  h.respond(0,retained?429:204,{'retry-after':'0.01','x-ratelimit-remaining':'0','x-ratelimit-reset-after':'0.1'},'{}');
+  let b;if(!retained){await a;b=h.handler.request('PATCH',url,true);}await h.advance(20);
+  const global=h.handler.request('POST',callback,true,{rejectOn429:true}).catch(e=>e);await h.flush();h.respond(1,429,{'retry-after':'0.2','x-ratelimit-global':'true'},'{}');await global;
+  await h.advance(81);assert.equal(h.sent.length,2);assert.equal(h.handler.readyQueue.length,1);
+  await h.advance(119);assert.equal(h.sent.length,3);h.respond(2,204);await (b||a);
+});
+test('idle eviction reacquires fresh identity; active replacement cannot be deleted',async()=>{
+  const h=harness(), p=h.handler.request('PATCH',url,false);await h.flush();const route=h.handler.routefy(url,'PATCH'), old=h.handler.ratelimits[route];h.respond(0,204);await p;await h.advance(30000);assert.equal(h.handler.ratelimits[route],undefined);
+  const q=h.handler.request('PATCH',url,false);await h.flush();const fresh=h.handler.ratelimits[route];assert.notEqual(fresh,old);await h.advance(30000);assert.equal(h.handler.ratelimits[route],fresh);h.respond(1,204);await q;
+  // Force a replacement between sweep capture and its identity check.
+  const replacement={owners:1,processing:true,_queue:[],reset:0};Object.defineProperty(fresh,'reset',{get(){h.handler.ratelimits[route]=replacement;return 0;}});
+  await h.advance(30000);assert.equal(h.handler.ratelimits[route],replacement);
+});
+test('large unique webhook burst has one sweep and releases all idle buckets',async()=>{
+  const h=harness(), ps=[];for(let i=0;i<1000;i++)ps.push(h.handler.request('PATCH',url.replace('x'.repeat(64),String(i).padStart(64,'x')),false));await h.flush();
+  assert.equal(h.sent.length,1000);assert.equal(Object.keys(h.handler.ratelimits).length,1000);assert.equal(h.timers.filter(t=>t.unreffed).length,1);
+  for(let i=0;i<1000;i++)h.respond(i,204);await Promise.all(ps);await h.advance(30000);assert.equal(Object.keys(h.handler.ratelimits).length,0);assert.equal(h.timers.length,0);
+});
+test('detached 502 ownership spans sweep and preserves debug message',async()=>{
+  const h=harness(), debug=[];h.client.on('debug',s=>debug.push(s));const p=h.handler.request('PATCH',url,false);await h.flush();const bucket=Object.values(h.handler.ratelimits)[0];
+  // Reply just before each two-second boundary; sweep at 30s occurs during detached sleep.
+  for(let i=0;i<16;i++){await h.advance(1900);h.respond(h.sent.length-1,502);assert.equal(bucket.owners,1);assert.equal(bucket.processing,false);await h.advance(2000);assert.equal(Object.values(h.handler.ratelimits)[0],bucket);}
+  h.respond(h.sent.length-1,204);await p;assert.equal(debug.filter(s=>s==='A wild 502 appeared! Thanks CloudFlare!').length,16);await h.advance(30000);assert.equal(Object.keys(h.handler.ratelimits).length,0);
+});
+test('retry preserves payload/file/control and baseline audit-reason behavior',async()=>{
+  for(const multipart of [false,true]){
+    const h=harness(), body={content:'A',reason:'audit%20reason',rejectOn429:true}, file=multipart?{file:Buffer.from('x'),name:'x'}:undefined, original=JSON.stringify(body);
+    const p=h.handler.request('PATCH',url,false,body,file).catch(e=>e);await h.flush();h.respond(0,502);await h.advance(2000);
+    assert.equal(h.sent[0].options.headers['X-Audit-Log-Reason'],'audit%20reason');assert.equal(h.sent[1].options.headers['X-Audit-Log-Reason'],undefined);assert.equal(JSON.stringify(body),original);
+    if(!multipart)assert.equal(h.sent[0].data,h.sent[1].data);else for(const r of h.sent){const wire=Buffer.concat(r.chunks.map(x=>Buffer.from(x))).toString();assert(wire.includes('name="content"'));assert(!wire.includes('rejectOn429'));assert(!wire.includes('name="reason"'));}
+    h.respond(1,429,{'retry-after':'0'},'{}');assert.equal((await p).name,'DiscordHTTPError');await h.advance(10);assert.equal(h.sent.length,2);
+  }
+});
+test('phase pairs balance, details cap at eight, omitted and completion remain exact',async()=>{
+  const h=harness(), events=[], channel=require('diagnostics_channel').channel('eris.request.phase'), listener=e=>events.push(e);channel.subscribe(listener);
+  try{
+    const p=h.handler.request('PATCH',url,true);await h.flush();
+    for(let i=0;i<10;i++){h.respond(i,429,{'retry-after':'0'},'{}');await h.advance(0);}h.respond(10,204);await p;
+    const starts=events.filter(e=>e.event==='start'), ends=events.filter(e=>e.event==='end'), completes=events.filter(e=>e.event==='complete');
+    assert.equal(starts.length,16);assert.equal(ends.length,16);for(const e of starts)assert.equal(ends.filter(x=>x.phase===e.phase).length,1);
+    assert(starts.every(e=>e.phase.labels.attempt<=8));assert.equal(completes.length,1);assert.equal(completes[0].attempts,11);assert.equal(completes[0].omitted,5);assert.deepEqual(Object.keys(completes[0].waits).sort(),['retry','route_queue']);
+  }finally{channel.unsubscribe(listener);}
+});
+
+test('sweep requires a finite expired reset including latency and preserves queued state',async()=>{
+  for(const reset of [NaN,Infinity,-Infinity,129950]){
+    const h=harness({ratelimiterOffset:100}),p=h.handler.request('PATCH',url,false);await h.flush();h.respond(0,204);await p;
+    const route=h.handler.routefy(url,'PATCH'),bucket=h.handler.ratelimits[route];bucket.reset=reset;await h.advance(30000);assert.equal(h.handler.ratelimits[route],bucket);
+    bucket.reset=0;bucket._queue.push(()=>{});await h.advance(30000);assert.equal(h.handler.ratelimits[route],bucket);bucket._queue.length=0;await h.advance(30000);assert.equal(h.handler.ratelimits[route],undefined);
+  }
+});
+test('body-only global rejection uses JSON delay independently of retry decision',async()=>{
+  const h=harness(),p=h.handler.request('POST',callback,true,{rejectOn429:true}).catch(e=>e);await h.flush();
+  h.respond(0,429,{'content-type':'application/json','retry-after':'0.001'},'{"global":true,"retry_after":0.05}');assert.equal((await p).name,'DiscordHTTPError');assert.equal(h.handler.globalBlock,true);
+  await h.advance(49);assert.equal(h.handler.globalBlock,true);await h.advance(1);assert.equal(h.handler.globalBlock,false);assert.equal(h.sent.length,1);
+});
+test('ready phases balance across startup and a new global wakeup block',async()=>{
+  const h=harness({forceQueueing:true}), events=[], channel=require('diagnostics_channel').channel('eris.request.phase'), listener=e=>events.push(e);channel.subscribe(listener);
+  try{
+    const p=h.handler.request('PATCH',url,true);await h.flush();h.handler.globalUnblock();await h.flush();h.respond(0,429,{'retry-after':'0.01','x-ratelimit-reset-after':'0.1','x-ratelimit-remaining':'0'},'{}');await h.advance(20);
+    h.handler.globalBlock=true;h.handler.globalRatelimit=true;await h.advance(81);assert.equal(h.sent.length,1);h.handler.globalUnblock();await h.flush();h.respond(1,204);await p;
+    const starts=events.filter(e=>e.event==='start'),ends=events.filter(e=>e.event==='end');assert.equal(starts.filter(e=>e.phase.name==='ready_queue').length,2);assert.equal(starts.length,ends.length);for(const e of starts)assert.equal(ends.filter(x=>x.phase===e.phase).length,1);assert.equal(events.filter(e=>e.event==='complete').length,1);
+  }finally{channel.unsubscribe(listener);}
+});
+
+test('retained 429 preserves JSON/control and baseline audit-reason behavior',async()=>{
+  const h=harness(),body={content:'same',reason:'why%20now',rejectOn429:false},before=JSON.stringify(body),p=h.handler.request('PATCH',url,false,body);await h.flush();h.respond(0,429,{'retry-after':'0.01'},'{}');await h.advance(10);
+  assert.equal(h.sent[0].data,h.sent[1].data);assert.equal(h.sent[0].options.headers['X-Audit-Log-Reason'],'why%20now');assert.equal(h.sent[1].options.headers['X-Audit-Log-Reason'],undefined);assert.equal(JSON.stringify(body),before);h.respond(1,204);await p;
+});
+test('JSON null HTTP error releases logical ownership',async()=>{
+ const h=harness(),p=h.handler.request('PATCH',url,false).catch(e=>e);await h.flush();
+ h.respond(0,400,{'content-type':'application/json'},'null');assert.equal((await p).name,'DiscordHTTPError');
+ assert.equal(Object.values(h.handler.ratelimits)[0].owners,0);
+});
