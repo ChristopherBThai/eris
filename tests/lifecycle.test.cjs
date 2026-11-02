@@ -170,6 +170,67 @@ test('callback global429 reject retains application-global bookkeeping',async()=
  await h.advance(50);assert.equal(h.handler.globalBlock,false);
 });
 
+
+// S02-r4: terminal cooldown and unusable body conversion regressions.
+for(const scope of ['user','shared','global'])for(const offset of [0,25])for(const [label,extra,delay] of [
+  ['header',{'retry-after':'0.05'},50],
+  ['reset precedence',{'retry-after':'0.05','x-ratelimit-reset-after':'0.08'},80],
+  ['absent',{},0], ['invalid',{'retry-after':'invalid'},0],
+])test(`terminal 429 cooldown ${scope} ${offset} ${label}`,async()=>{
+  const h=harness({ratelimiterOffset:offset});let settlements=0;
+  const a=h.handler.request('POST','/normal',true,{rejectOn429:true}).catch(e=>{settlements++;return e;});
+  const b=h.handler.request('POST','/normal',true);await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0];assert.equal(bucket.owners,2);
+  const resp=h.respond(0,429,{'content-type':'application/json','x-ratelimit-remaining':'0','x-ratelimit-scope':scope,...(scope==='global'?{'x-ratelimit-global':'true'}:{}),...extra},'{}');
+  assert.equal((await a).name,'DiscordHTTPError');assert.equal(bucket.owners,1);
+  const c=h.handler.request('POST','/independent',true);await h.flush();
+  const globalDelay=scope==='global'&&extra['retry-after']==='0.05'?50:0;
+  assert.equal(h.sent.length,globalDelay?1:2);
+  if(globalDelay){await h.advance(globalDelay);assert.equal(h.sent[1].options.path,'/api/v10/independent');}
+  h.respond(1,204);await c;
+  const wait=delay+offset+1;
+  await h.advance(wait-globalDelay-1);assert.equal(h.sent.length,2);
+  await h.advance(1);assert.equal(h.sent.length,3);assert.equal(h.sent[2].at,100000+wait);
+  resp.emit('end');resp.emit('aborted');await h.flush();assert.equal(settlements,1);assert.equal(bucket.owners,1);
+  h.respond(2,204);await b;assert.equal(bucket.owners,0);assert.equal(bucket.processing,false);
+});
+for(const scope of ['user','shared','global'])for(const isCallback of [false,true])for(const terminal of [false,true])test(`overflow fallback ${scope} callback=${isCallback} terminal=${terminal}`,async()=>{
+  const h=harness(),endpoint=isCallback?callback:'/normal';let settlements=0;
+  const a=h.handler.request('POST',endpoint,true,{rejectOn429:terminal}).then(()=>{settlements++;},e=>{settlements++;return e;});
+  const b=isCallback?null:h.handler.request('POST',endpoint,true);await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0];
+  h.respond(0,429,{'content-type':'application/json','retry-after':'0.03','x-ratelimit-remaining':'9','x-ratelimit-scope':scope,...(scope==='global'?{'x-ratelimit-global':'true'}:{})},'{"retry_after":1e308}');
+  await h.flush();if(terminal)assert.equal((await a).name,'DiscordHTTPError');else assert.equal(settlements,0);
+  const c=h.handler.request('POST','/independent',true);await h.flush();
+  assert.equal(h.handler.globalBlock,scope==='global');
+  const initial=h.sent.length;await h.advance(29);assert.equal(h.sent.length,initial);
+  await h.advance(1);
+  const independent=h.sent.find(r=>r.options.path.endsWith('/independent'));assert(independent);assert.equal(independent.at,scope==='global'?100030:100000);
+  if(bucket)assert.equal(bucket.owners,terminal?1:2);
+  if(!terminal&&!isCallback)assert.equal(h.sent.filter(r=>r.options.path===h.sent[0].options.path).length,2);
+  if(!terminal){const retry=h.sent.find((r,i)=>i>0&&r.options.path===h.sent[0].options.path);assert(retry);assert.equal(retry.at,100030);}
+  // Finish all sends, including B admitted only after A succeeds.
+  for(let i=1;i<h.sent.length;i++){h.respond(i,204);await h.flush();}
+  await Promise.all([a,b,c]);assert.equal(settlements,1);if(bucket)assert.equal(bucket.owners,0);
+});
+for(const scope of ['user','shared','global'])for(const header of [undefined,'invalid','9'.repeat(309)])test(`overflow without usable fallback ${scope} ${header}`,async()=>{
+  const h=harness();let settlements=0;
+  const a=h.handler.request('POST','/normal',true).catch(e=>{settlements++;return e;}),b=h.handler.request('POST','/normal',true);await h.flush();
+  const bucket=Object.values(h.handler.ratelimits)[0];
+  const resp=h.respond(0,429,{'retry-after':header,'x-ratelimit-scope':scope,...(scope==='global'?{'x-ratelimit-global':'true'}:{})},'{"retry_after":1e308}');
+  assert.match((await a).message,/Invalid 429 retry delay/);assert.equal(h.handler.globalBlock,false);assert.equal(bucket.owners,1);
+  resp.emit('end');resp.emit('aborted');await h.flush();assert.equal(settlements,1);assert.equal(h.sent.length,2);
+  h.respond(1,204);await b;assert.equal(bucket.owners,0);
+});
+
+test('finite converted delay above timer range remains authoritative',async()=>{
+  const h=harness(),a=h.handler.request('POST',callback,false);await h.flush();
+  h.respond(0,429,{'retry-after':'0.03'},'{"retry_after":3000000}');
+  assert(h.timers.some(t=>t.at===100000+3000000000));
+  await h.advance(30);assert.equal(h.sent.length,1);
+  await h.advance(3000000000-30);assert.equal(h.sent[1].at,100000+3000000000);h.respond(1,204);await a;
+});
+
 // S02_ONLY
 for (const [body,header,delay] of [
   ['{"retry_after":0.08}','0.02',80], ['{"retry_after":0}','1',0],
