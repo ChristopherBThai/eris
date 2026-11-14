@@ -28,13 +28,13 @@ function identifyFor(platform, id = 0, maxShards = 1) {
   return payloads[0];
 }
 
-test("supported platforms populate Identify browser and device properties exactly", () => {
+test("supported platforms populate the Identify browser while preserving device", () => {
   for (const platform of platforms) {
     const { payload } = identifyFor(platform);
     assert.deepEqual(payload.properties, {
       os: process.platform,
       browser: platform,
-      device: platform,
+      device: "Eris",
     });
   }
 });
