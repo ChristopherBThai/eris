@@ -529,6 +529,7 @@ declare namespace Eris {
     maxShards?: number | "auto";
     messageLimit?: number;
     opusOnly?: boolean;
+    platform?: "Discord VR" | "Discord iOS" | "Discord Android" | "Discord Web" | "Discord Embedded" | "Discord Client";
     /** @deprecated */
     ratelimiterOffset?: number;
     reconnectDelay?: ReconnectDelayFunction;
