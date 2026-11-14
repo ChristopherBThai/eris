@@ -48,6 +48,33 @@ bot.on("messageCreate", (msg) => { // When a message is created
 bot.connect(); // Get the bot to connect to Discord
 ```
 
+Gateway platform identification
+--------------------------------
+
+You can choose the client identifier sent in the Gateway Identify `browser` and `device` properties with the `platform` option. This is separate from the bot's online presence status, which is still controlled by `bot.editStatus()`.
+
+Supported values are `"Discord VR"`, `"Discord iOS"`, `"Discord Android"`, `"Discord Web"`, `"Discord Embedded"`, and `"Discord Client"` (exact capitalization required).
+
+```js
+const Eris = require("eris");
+
+// VR
+const vrBot = new Eris("Bot TOKEN", { platform: "Discord VR" });
+
+// iOS
+const iosBot = new Eris("Bot TOKEN", { platform: "Discord iOS" });
+
+// Web
+const webBot = new Eris("Bot TOKEN", { platform: "Discord Web" });
+
+// Embedded
+const embeddedBot = new Eris("Bot TOKEN", { platform: "Discord Embedded" });
+
+vrBot.connect();
+```
+
+If `platform` is omitted, Eris retains its default `"Eris"` identifier. Invalid values throw a `TypeError`. This changes only the Gateway Identify properties; it does not change presence, activity, or guarantee how Discord displays the client.
+
 More examples can be found in [the examples folder](https://github.com/abalabahaha/eris/tree/master/examples).
 
 Useful Links
