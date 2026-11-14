@@ -51,7 +51,7 @@ bot.connect(); // Get the bot to connect to Discord
 Gateway platform identification
 --------------------------------
 
-You can choose the client identifier sent in the Gateway Identify `browser` and `device` properties with the `platform` option. This is separate from the bot's online presence status, which is still controlled by `bot.editStatus()`.
+You can choose the client identifier sent in the Gateway Identify `browser` property with the `platform` option. Eris keeps the existing `device` property unchanged. This is separate from the bot's online presence status, which is still controlled by `bot.editStatus()`.
 
 Supported values are `"Discord VR"`, `"Discord iOS"`, `"Discord Android"`, `"Discord Web"`, `"Discord Embedded"`, and `"Discord Client"` (exact capitalization required).
 
